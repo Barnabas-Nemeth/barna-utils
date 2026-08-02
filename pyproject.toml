@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "barna-utils"
+version = "0.1.0"
+description = "General-purpose LSF/cluster infrastructure helpers shared across idh_astro projects (not spatial-biology specific -- see IDH-Spatial_Transcriptomics/common/ for that)."
+requires-python = ">=3.10"
+dependencies = [
+    "ipython",
+]
+
+[project.optional-dependencies]
+widgets = ["ipywidgets"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
