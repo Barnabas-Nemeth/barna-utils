@@ -37,8 +37,11 @@ correctly reported completion when the actual job finished.
 
 ## Modules
 
-- **`barna_utils.lsf`** — `submit_and_wait()` (single job, poll until done) and
-  `submit_multi_and_wait()` (several independent jobs, one combined status display). Supports
+- **`barna_utils.lsf`** — `submit_and_wait()` (single job, poll until done),
+  `submit_multi_and_wait()` (several independent jobs, one combined status display), and
+  `submit()` (fire-and-forget: submit and return the job ID immediately, no polling -- for the
+  "launch N jobs now, check back on them in a separate cell later" pattern, e.g. a parameter
+  sweep with many candidates, where blocking the notebook isn't the point). All three support
   every resource flag found across the five prior implementations: `queue`, `cpus`,
   `memory_mb`, `span_hosts`, `gpu_flag`, `gpu_model_select`. Deliberately never sets email
   flags or a walltime limit (this project's queues don't need one, and letting LSF apply its

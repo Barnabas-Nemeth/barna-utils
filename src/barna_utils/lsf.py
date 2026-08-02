@@ -104,6 +104,47 @@ def _job_status_final(job_id):
     return r.stdout.strip().split()[2] if r.stdout.strip() else 'DONE'
 
 
+def submit(job_name, lsf_profile, stage, cmd_args, logs_dir, project='OE0146',
+           extra_bsub_args=None, skip_if_exists=None):
+    """Submit `cmd_args` as an LSF job and return immediately with its job ID
+    (or the ID of an already-running job with the same name, or None on
+    submission failure) -- no polling, no waiting.
+
+    For the common "submit N jobs now, come back and check on them later in
+    a separate cell" pattern (e.g. a parameter sweep with many candidates),
+    where blocking the notebook until every job finishes isn't the point.
+    Use `submit_and_wait`/`submit_multi_and_wait` instead whenever the cell
+    should actually wait for completion.
+
+    `skip_if_exists`, if given, is a path (or list of paths) checked before
+    submitting -- if all already exist, submission is skipped and this
+    returns None without calling bsub at all.
+    """
+    if skip_if_exists is not None:
+        paths = [skip_if_exists] if isinstance(skip_if_exists, (str, Path)) else skip_if_exists
+        if all(Path(p).exists() for p in paths):
+            return None
+
+    existing = _find_running_job(job_name)
+    if existing:
+        return existing
+
+    stage_cfg = lsf_profile[stage]
+    logs_dir = Path(logs_dir)
+    log_out = logs_dir / f'{job_name}.%J.out'
+    log_err = logs_dir / f'{job_name}.%J.err'
+
+    bsub_args = _build_bsub_args(job_name, stage_cfg, log_out, log_err, project, extra_bsub_args)
+    bsub_args += cmd_args
+
+    res = subprocess.run(bsub_args, capture_output=True, text=True, timeout=30)
+    m = re.search(r'Job <(\d+)>', res.stdout)
+    if not m:
+        print(f'[{job_name}] Submission failed:', res.stdout or res.stderr)
+        return None
+    return m.group(1)
+
+
 def submit_and_wait(job_name, lsf_profile, stage, cmd_args, success_paths, logs_dir,
                      project='OE0146', extra_bsub_args=None, poll_interval=30,
                      force=False, progress_fn=None):
