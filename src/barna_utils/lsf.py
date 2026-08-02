@@ -61,6 +61,13 @@ def _build_bsub_args(job_name, stage_cfg, log_out, log_err, project, extra_bsub_
         args += ['-R', f"select[gpumodel=={stage_cfg['gpu_model_select']}]"]
     if extra_bsub_args:
         args += extra_bsub_args
+    # Prepend env-var exports to the command so the job inherits them.
+    # PYTHONUNBUFFERED=1 is always set so Python flushes stdout immediately
+    # (critical for log tailing on NFS where line-buffered writes can stall).
+    env_prefix = ['env', 'PYTHONUNBUFFERED=1']
+    if stage_cfg.get('env'):
+        env_prefix += [f'{k}={v}' for k, v in stage_cfg['env'].items()]
+    args += env_prefix
     return args
 
 
