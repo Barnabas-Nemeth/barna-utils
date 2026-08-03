@@ -13,6 +13,7 @@ dependencies = [
 
 [project.optional-dependencies]
 widgets = ["ipywidgets"]
+annotator = ["matplotlib", "shapely", "geopandas", "tifffile>=2026.6", "zarr", "scikit-image", "imagecodecs"]
 
 [tool.setuptools.packages.find]
 where = ["src"]
