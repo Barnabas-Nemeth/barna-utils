@@ -19,11 +19,40 @@ IHC TMA annotation, which stores images as pyramidal OME-TIFF and OME-Zarr
   `root.attrs['multiscales']` with numbered pyramid-level datasets), again
   matching IHC's own actual output structure rather than a guessed one.
 
-Canvas dicts returned here also include `channel_planes` (each channel's
-CLAHE-equalized plane + assigned color, precomputed once) whenever more than
-a single channel is involved, so `MultiRegionAnnotator`'s live per-channel
-toggle buttons can cheaply re-blend a subset of channels without re-reading
-or re-equalizing anything.
+Canvas dicts returned here also include:
+
+- `channel_planes` -- each channel's *raw* pixel plane + assigned color
+  (see `_compute_channel_planes`), so `MultiRegionAnnotator`'s live
+  per-channel toggle buttons and contrast/CLAHE controls can cheaply
+  re-blend/re-normalize a subset of channels via `composite_channel_planes`
+  without ever re-reading from disk. Normalized results are memoized per
+  `(pct_low, pct_high, use_clahe)` combination actually used, so repeated
+  redraws at unchanged settings are free.
+- `channel_names` -- `{channel_index: display_name}`, using each channel's
+  *real* embedded name from the file's own metadata whenever present
+  (falling back to excitation wavelength, then a plain positional label --
+  see `_channel_display_name`). Confirmed empirically that IHC's raw TMA
+  scan has no real channel names (OME-XML `Channel Name=""` throughout,
+  only `ExcitationWavelength` populated), but IHC's *stitched/merged*
+  outputs (both the OME-Zarr and the derived pyramid OME-TIFF) do carry
+  real marker names end-to-end -- the case that actually matters for
+  day-to-day annotation.
+- `hires_fetcher` -- a callable `(x0, y0, x1, y1, target_max_dim) ->
+  {'channel_planes', 'extent_overview_px', 'level'}` (see
+  `_make_hires_fetcher`) that fetches a small on-demand crop from a much
+  finer pyramid level for just the currently-visible region, in the
+  overview canvas's own pixel coordinate space. This backs
+  `MultiRegionAnnotator`'s debounced "always sharp while zoomed in"
+  behavior -- the low-res overview stays the default (fast to pan/zoom),
+  and only the actual visible crop gets replaced with a higher-resolution
+  fetch once panning/zooming settles, rather than ever loading a whole
+  gigapixel-scale level into memory at once.
+
+CLAHE (`use_clahe` in `composite_channel_planes`/`_clahe_equalize`) defaults
+to **off**: it was only ever needed for MERFISH's own poor-quality DAPI
+mosaics, not real fluorescence imaging, and it's the expensive step in the
+normalization pipeline -- so it's opt-in via the annotator's CLAHE toggle,
+not paid for by default.
 
 The MERSCOPE DAPI-mosaic provider is NOT here -- it stays in MERFISH's own
 notebook/scripts, since building it requires MERSCOPE-specific mosaic-tile
@@ -31,13 +60,6 @@ assembly logic (`dapi_utils.py`) that has no equivalent generic meaning.
 Any canvas provider is just a plain callable `(run) -> dict`, so MERFISH's
 existing `GLOBAL_CANVAS`-based approach can be wrapped in a one-line lambda
 and passed to the generalized `MultiRegionAnnotator` unchanged.
-
-NOT YET VALIDATED against a real IHC file end-to-end (no display available to
-an automated agent to actually confirm the rendered image looks correct) --
-the reading/reshaping logic was written directly against IHC's own
-documented zarr structure, not guessed, but treat this as needing a real
-smoke test (open the annotator against an actual TMA file, confirm the image
-looks right) before relying on it.
 """
 import numpy as np
 import zarr
@@ -72,63 +94,159 @@ _DEFAULT_CHANNEL_COLORS = ['blue', 'green', 'red', 'cyan', 'magenta', 'yellow',
                            'white', 'orange', 'purple']
 
 
-def _normalize_channel_spec(channels):
+def _normalize_channel_spec(channels, channel_info=None):
     """Convert any of the three accepted `channels` forms into the one
     canonical shape everything downstream (compositing, live toggling)
     actually works with: `{channel_index: color}`.
 
-    - a single int -> `{idx: 'white'}` (renders as grayscale).
-    - a list of ints -> each assigned a distinct default color (falls back
-      to the same R/G/B-first ordering as before for the first 3, so
-      existing 3-channel calls look the same as before this refactor, but
-      any number of channels is now supported here too, not just 3).
-    - a dict -> returned as-is (already canonical).
+    - a single int -> that channel's real color from `channel_info` if
+      known, else 'white' (grayscale).
+    - a list of ints -> each channel's real color from `channel_info` if
+      known, else a distinct default color per position.
+    - a dict -> returned as-is (already canonical; explicit colors always
+      win over metadata-derived ones).
+
+    `channel_info`, if given, is `{channel_index: {'name':..., 'color':...}}`
+    (see `_extract_ome_tiff_channel_info`/`_extract_ome_zarr_channel_info`)
+    -- real per-channel colors read from the file's own metadata (e.g.
+    IHC's stitched OME-Zarr embeds a genuine display color per marker),
+    used as smarter defaults than an arbitrary fixed color list whenever a
+    channel's color isn't explicitly specified.
     """
+    channel_info = channel_info or {}
+
+    def _default_color(idx, position):
+        info_color = channel_info.get(idx, {}).get('color')
+        if info_color:
+            return info_color
+        return _DEFAULT_CHANNEL_COLORS[position % len(_DEFAULT_CHANNEL_COLORS)]
+
     if isinstance(channels, dict):
         return dict(channels)
     if isinstance(channels, (int, np.integer)):
-        return {int(channels): 'white'}
-    return {int(c): _DEFAULT_CHANNEL_COLORS[i % len(_DEFAULT_CHANNEL_COLORS)]
-            for i, c in enumerate(channels)}
+        idx = int(channels)
+        return {idx: _default_color(idx, 0) if channel_info else 'white'}
+    return {int(c): _default_color(int(c), i) for i, c in enumerate(channels)}
+
+
+def _channel_display_name(idx, channel_info):
+    """Best available label for channel `idx`: its real embedded name if
+    the file has one, else its excitation wavelength (still real metadata,
+    just less specific), else a plain positional fallback. Never invents a
+    marker name that isn't actually in the file -- if neither is present,
+    say so plainly rather than guess."""
+    info = (channel_info or {}).get(idx, {})
+    if info.get('name'):
+        return info['name']
+    if info.get('wavelength_nm') is not None:
+        return f'{info["wavelength_nm"]:g}nm'
+    return f'Ch{idx}'
+
+
+def _extract_ome_tiff_channel_info(tif):
+    """Parse the real per-channel `Name`/`Color`/`ExcitationWavelength` out
+    of an OME-TIFF's embedded OME-XML (proper XML parsing, not regex).
+    Returns `{channel_index: {'name': str|None, 'color': str|None,
+    'wavelength_nm': float|None}}`. A file with no OME-XML at all, or with
+    every `Name` attribute empty (confirmed to happen in practice -- IHC's
+    own raw TMA scan has this: SizeC=6 channels, every `Name=""`, only
+    `ExcitationWavelength` populated), returns an empty-name/color dict
+    per channel rather than failing -- callers fall back via
+    `_channel_display_name`/`_normalize_channel_spec`."""
+    xml = getattr(tif, 'ome_metadata', None)
+    if not xml:
+        return {}
+    import xml.etree.ElementTree as ET
+    root = ET.fromstring(xml)
+    ns = {'ome': 'http://www.openmicroscopy.org/Schemas/OME/2016-06'}
+    info = {}
+    for i, ch in enumerate(root.findall('.//ome:Channel', ns)):
+        name = ch.get('Name') or None
+        color_int = ch.get('Color')
+        color = None
+        if color_int is not None:
+            # OME stores Color as a signed 32-bit RGBA integer.
+            v = int(color_int) & 0xFFFFFFFF
+            r, g, b = (v >> 24) & 0xFF, (v >> 16) & 0xFF, (v >> 8) & 0xFF
+            if (r, g, b) != (0, 0, 0):  # (0,0,0) is not a usable display color
+                color = f'#{r:02x}{g:02x}{b:02x}'
+        exc = ch.get('ExcitationWavelength')
+        info[i] = {'name': name, 'color': color,
+                   'wavelength_nm': float(exc) if exc is not None else None}
+    return info
+
+
+def _extract_ome_zarr_channel_info(root):
+    """Read the real per-channel `label`/`color` out of an OME-NGFF zarr
+    store's `omero.channels[]` metadata (confirmed present and populated in
+    IHC's own stitched output -- real marker names like "Nuclei (DAPI)",
+    "Ki-67 (Alexa Fluor 488)", each with a real hex display color). Returns
+    the same shape as `_extract_ome_tiff_channel_info`. A store with no
+    `omero` block (not every OME-Zarr writer includes one) returns `{}`."""
+    channels = root.attrs.get('omero', {}).get('channels', [])
+    info = {}
+    for i, ch in enumerate(channels):
+        color = ch.get('color')
+        info[i] = {
+            'name': ch.get('label') or None,
+            'color': f'#{color}' if color else None,
+            'wavelength_nm': None,
+        }
+    return info
 
 
 def _compute_channel_planes(arr, channel_spec):
     """`arr` is (C, H, W); `channel_spec` is `{channel_index: color}`
     (see `_normalize_channel_spec`). Returns `{channel_index: (color,
-    rgb_array, raw_plane)}` -- the *raw* (unprocessed) per-channel pixel
-    data, read from disk exactly once here and cached by the caller. Kept
-    raw (not pre-CLAHE'd) specifically so contrast/cutoff adjustments and
-    channel toggling (see `composite_channel_planes`) are cheap in-memory
-    recomputations, never a re-read.
+    rgb_array, raw_plane, cache_dict)}` -- the *raw* (unprocessed) per-channel
+    pixel data, read from disk exactly once here. Kept raw (not
+    pre-normalized) specifically so contrast/cutoff adjustments and channel
+    toggling (see `composite_channel_planes`) are cheap in-memory
+    recomputations, never a re-read. `cache_dict` (initially empty, mutated
+    in place by `composite_channel_planes`) memoizes the normalized result
+    per `(pct_low, pct_high, use_clahe)` combination actually requested, so
+    e.g. toggling a channel on/off costs nothing once it's been shown once
+    at the current settings, and only a genuinely new contrast/CLAHE setting
+    pays the real (CLAHE especially) computation cost.
     """
     import matplotlib.colors as mcolors
     planes = {}
     for c, color in channel_spec.items():
         raw = np.asarray(arr[c])
         rgb = np.array(mcolors.to_rgb(color), dtype=np.float32)
-        planes[c] = (color, rgb, raw)
+        planes[c] = (color, rgb, raw, {})
     return planes
 
 
 def composite_channel_planes(channel_planes, active=None, pct_low=1, pct_high=99,
-                             use_clahe=True):
+                             use_clahe=False):
     """Blend cached raw per-channel planes (see `_compute_channel_planes`)
     into a displayable RGB array, applying the percentile cutoff (and,
-    unless disabled, CLAHE) at blend time.
+    only if requested, CLAHE) at blend time -- memoized per channel per
+    `(pct_low, pct_high, use_clahe)` combination (see `_compute_channel_planes`'s
+    `cache_dict`), so repeated calls with unchanged settings (e.g. toggling
+    a *different* channel, or redrawing after a pan/zoom) never recompute
+    normalization for channels whose settings didn't change.
 
     `active`, if given, restricts the blend to a subset of channel indices
     (the annotator's live channel-toggle buttons). `pct_low`/`pct_high` are
-    the "top/bottom cutoff" contrast control (which percentile of each
-    channel's pixel intensities maps to black/white) -- adjustable live via
-    the annotator's contrast controls, recomputed here each time rather than
-    cached, since it's a per-view display choice, not a property of the data.
+    the "top/bottom cutoff" contrast control. `use_clahe` defaults to False
+    -- adaptive histogram equalization is the expensive step and was only
+    ever needed for MERFISH's poor-quality DAPI; real fluorescence imaging
+    (IHC's own use case) generally looks correct with plain percentile
+    rescaling alone, so it's opt-in via the annotator's CLAHE toggle, not
+    always paid for.
     """
     any_raw = next(iter(channel_planes.values()))[2]
     disp = np.zeros((*any_raw.shape, 3), dtype=np.float32)
-    for c, (_color, rgb, raw) in channel_planes.items():
+    key = (pct_low, pct_high, use_clahe)
+    for c, (_color, rgb, raw, cache) in channel_planes.items():
         if active is not None and c not in active:
             continue
-        plane = _clahe_equalize(raw, pct_low=pct_low, pct_high=pct_high, use_clahe=use_clahe)
+        plane = cache.get(key)
+        if plane is None:
+            plane = _clahe_equalize(raw, pct_low=pct_low, pct_high=pct_high, use_clahe=use_clahe)
+            cache[key] = plane
         disp += plane[..., np.newaxis] * rgb[np.newaxis, np.newaxis, :]
     return np.clip(disp, 0.0, 1.0)
 
@@ -166,6 +284,56 @@ def _pick_level(shapes_by_level, target_max_dim=2048):
     return max(shapes_by_level, key=lambda k: max(shapes_by_level[k][-2], shapes_by_level[k][-1]))
 
 
+def _make_hires_fetcher(get_level_array, shapes_by_level, overview_level, spec):
+    """Build the `hires_fetcher(x0, y0, x1, y1, target_max_dim)` closure
+    stored in a canvas dict, used by `MultiRegionAnnotator`'s debounced
+    "always sharp while zoomed in" behavior. `get_level_array(level_key)`
+    returns the (C, H, W) zarr-backed array for a given pyramid level
+    (opened lazily -- indexing it only reads the chunks actually touched,
+    which is what makes fetching a small high-res crop out of a
+    gigapixel-scale image fast). Coordinates in and out are always in the
+    *overview* level's canvas-pixel space, so the caller never needs to
+    know about the underlying pyramid's level scale factors.
+    """
+    overview_shape = shapes_by_level[overview_level]
+
+    def _fetcher(x0, y0, x1, y1, target_max_dim=1024):
+        x0, x1 = sorted((max(0, x0), min(overview_shape[-1], x1)))
+        y0, y1 = sorted((max(0, y0), min(overview_shape[-2], y1)))
+        if x1 <= x0 or y1 <= y0:
+            return None
+
+        # Pick the finest level whose crop of this same physical region
+        # wouldn't exceed target_max_dim in either dimension -- the same
+        # "just enough resolution, not more than needed" logic as
+        # _pick_level, just evaluated for a sub-region instead of the whole
+        # image so it can go much finer without the crop becoming huge.
+        best_level, best_scale = overview_level, 1.0
+        for level, shape in shapes_by_level.items():
+            scale = shape[-1] / overview_shape[-1]  # this level's pixels per overview pixel
+            crop_w, crop_h = (x1 - x0) * scale, (y1 - y0) * scale
+            cur_scale = shapes_by_level[best_level][-1] / overview_shape[-1]
+            if scale > cur_scale and max(crop_w, crop_h) <= target_max_dim:
+                best_level, best_scale = level, scale
+
+        arr = get_level_array(best_level)
+        fy0, fy1 = int(y0 * best_scale), int(y1 * best_scale)
+        fx0, fx1 = int(x0 * best_scale), int(x1 * best_scale)
+        if arr.ndim == 2:
+            crop = np.asarray(arr[fy0:fy1, fx0:fx1])[np.newaxis, ...]
+        else:
+            crop = np.asarray(arr[:, fy0:fy1, fx0:fx1])
+
+        channel_planes = _compute_channel_planes(crop, spec)
+        return {
+            'channel_planes': channel_planes,
+            'extent_overview_px': (x0, x1, y1, y0),  # matplotlib imshow extent order
+            'level': best_level,
+        }
+
+    return _fetcher
+
+
 def ome_tiff_canvas_provider(paths_by_run, channels=0, target_max_dim=2048):
     """Build a `canvas_provider` callable for `MultiRegionAnnotator` that
     reads pyramidal OME-TIFF files via `tifffile`'s zarr bridge.
@@ -193,23 +361,32 @@ def ome_tiff_canvas_provider(paths_by_run, channels=0, target_max_dim=2048):
         # A pyramidal OME-TIFF's zarr bridge exposes one array per series/level;
         # tifffile names singleton/multi-level arrays "0", "1", ... in
         # decreasing resolution, matching what IHC's own reader does
-        # (`zarr.open(tif.aszarr(), mode="r")["0"]`).
+        # (`zarr.open(tif.aszarr(), mode="r")["0"]`). `get_level_array` keeps
+        # the lazy zarr handle (not a fully-read numpy array) per level, so
+        # `hires_fetcher` can later index just a small region of a much
+        # finer level without reading the whole thing.
         if hasattr(z, 'array_keys'):
             shapes = {k: z[k].shape for k in z.array_keys()}
             level = _pick_level(shapes, target_max_dim)
-            arr = z[level]
+            get_level_array = lambda lvl: z[lvl]  # noqa: E731
         else:
-            arr = z  # a plain (non-pyramidal) array
+            shapes = {'0': z.shape}
+            level = '0'
+            get_level_array = lambda lvl: z  # noqa: E731  (no finer level exists)
 
-        arr = np.asarray(arr)
+        arr = np.asarray(get_level_array(level))
         if arr.ndim == 2:
             arr = arr[np.newaxis, ...]  # treat as single-channel (1, H, W)
 
-        spec = _normalize_channel_spec(ch)
+        channel_info = _extract_ome_tiff_channel_info(tif)
+        spec = _normalize_channel_spec(ch, channel_info)
         channel_planes = _compute_channel_planes(arr, spec)
+        channel_names = {c: _channel_display_name(c, channel_info) for c in spec}
         disp_rgb = composite_channel_planes(channel_planes)
         H, W = disp_rgb.shape[0], disp_rgb.shape[1]
-        return {'W': W, 'H': H, 'disp_rgb': disp_rgb, 'channel_planes': channel_planes}
+        hires_fetcher = _make_hires_fetcher(get_level_array, shapes, level, spec)
+        return {'W': W, 'H': H, 'disp_rgb': disp_rgb, 'channel_planes': channel_planes,
+                'channel_names': channel_names, 'hires_fetcher': hires_fetcher}
 
     return _provider
 
@@ -233,15 +410,20 @@ def ome_zarr_canvas_provider(paths_by_run, channels=0, target_max_dim=2048):
         levels = [d['path'] for d in multiscales['datasets']]
         shapes = {lvl: root[lvl].shape for lvl in levels}
         level = _pick_level(shapes, target_max_dim)
-        arr = np.asarray(root[level])
+        get_level_array = lambda lvl: root[lvl]  # noqa: E731  (lazy zarr handle, see ome_tiff_canvas_provider)
+        arr = np.asarray(get_level_array(level))
 
         if arr.ndim == 2:
             arr = arr[np.newaxis, ...]
 
-        spec = _normalize_channel_spec(ch)
+        channel_info = _extract_ome_zarr_channel_info(root)
+        spec = _normalize_channel_spec(ch, channel_info)
         channel_planes = _compute_channel_planes(arr, spec)
+        channel_names = {c: _channel_display_name(c, channel_info) for c in spec}
         disp_rgb = composite_channel_planes(channel_planes)
         H, W = disp_rgb.shape[0], disp_rgb.shape[1]
-        return {'W': W, 'H': H, 'disp_rgb': disp_rgb, 'channel_planes': channel_planes}
+        hires_fetcher = _make_hires_fetcher(get_level_array, shapes, level, spec)
+        return {'W': W, 'H': H, 'disp_rgb': disp_rgb, 'channel_planes': channel_planes,
+                'channel_names': channel_names, 'hires_fetcher': hires_fetcher}
 
     return _provider

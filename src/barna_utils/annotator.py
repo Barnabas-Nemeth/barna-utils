@@ -23,15 +23,32 @@ plain SSH + Jupyter session without the remote-rendering problems napari hit
 elsewhere in this project.
 
 New on top of the original MERFISH-only version, added 2026-08-02/03 for
-multi-channel IHC use: a per-channel toggle row (click a channel's button to
-hide/show it in the composite -- only rendered when the canvas provides
-`channel_planes`, i.e. real multi-channel data, not MERFISH's single
-pre-rendered DAPI mosaic), a Low%/High% contrast control (adjusts the
-percentile cutoff used for display normalization, Apply-triggered rather
-than live-dragging since it recomputes CLAHE), and a Maximize/Restore toggle
-(resizes the figure to fill most of the screen -- not true OS/browser
-fullscreen, which isn't controllable from matplotlib itself, but the closest
-deliverable equivalent).
+multi-channel IHC use:
+
+- A per-channel toggle row (click a channel's button to hide/show it in the
+  composite -- only rendered when the canvas provides `channel_planes`, i.e.
+  real multi-channel data, not MERFISH's single pre-rendered DAPI mosaic).
+  Button labels use each channel's *real* embedded name (from the file's own
+  metadata, see `image_sources.py`), and on/off state is shown as a
+  distinct color/label change (real channel color + checkmark when on,
+  flattened gray + cross when off), not just a subtle alpha change.
+- A Low%/High% contrast control (adjusts the percentile cutoff used for
+  display normalization, Apply-triggered rather than live-dragging since it
+  recomputes the composite) and a CLAHE toggle (off by default -- adaptive
+  histogram equalization was only ever needed for MERFISH's poor-quality
+  DAPI, not real fluorescence imaging, and is the expensive step in the
+  normalization pipeline, so it's opt-in).
+- A Maximize/Restore toggle (resizes the figure to fill most of the screen
+  -- not true OS/browser fullscreen, which isn't controllable from
+  matplotlib itself, but the closest deliverable equivalent).
+- An on-demand higher-resolution overlay that keeps the view sharp while
+  zoomed in without paying full-resolution cost everywhere: the base canvas
+  is a fixed, pan/zoom-friendly overview, and once panning/zooming settles
+  (debounced ~250ms, see `_refresh_hires`/`_restart_hires_timer`), a crop of
+  just the visible region is fetched from a finer pyramid level (via the
+  canvas dict's `hires_fetcher`, see `image_sources.py`) and drawn over the
+  same coordinate footprint. Only active for canvases that provide a
+  `hires_fetcher` (MERFISH's single pre-rendered mosaic doesn't).
 
 IMPORTANT -- not yet interactively tested: this is a careful, mechanical
 refactor of the original interaction logic (global lookups -> constructor-
@@ -40,8 +57,9 @@ verified to import/instantiate correctly and (for the image-reading side)
 verified against real production data (see `image_sources.py`'s module
 note), but an interactive GUI's actual click/drag/button behavior can't be
 verified by an automated agent with no display to click on. Test this for
-real (open it, toggle channels, adjust contrast, draw a polygon, save,
-reload, maximize) before trusting it in production.
+real (open it, toggle channels, adjust contrast, toggle CLAHE, zoom in and
+confirm the hi-res overlay kicks in, draw a polygon, save, reload, maximize)
+before trusting it in production.
 """
 import time
 from pathlib import Path
@@ -161,11 +179,17 @@ class MultiRegionAnnotator:
         self._normal_figsize = None
         self._btn_maximize = None
         self._active_channels = None   # None == "show every channel"; else a set
-        self._channel_btns = []        # [(Button, channel_index), ...]
+        self._channel_btns = []        # [(Button, channel_index, color, name), ...]
         self._pct_low = 1.0
         self._pct_high = 99.0
         self._tb_low = None
         self._tb_high = None
+        self._use_clahe = False        # off by default -- only MERFISH's poor DAPI needed it
+        self._btn_clahe = None
+
+        self._hires_artist = None      # on-demand higher-res crop, drawn over the base image
+        self._hires_timer = None       # debounce: fetch only once pan/zoom settles
+        self._hires_debounce_ms = 250
         self._load_all_existing()
 
     # ── Properties ────────────────────────────────────────────────────────────
@@ -303,6 +327,9 @@ class MultiRegionAnnotator:
         self._edit_mode = False
         self._xlim = None
         self._ylim = None
+        if self._hires_timer is not None:
+            self._hires_timer.stop()
+        self._clear_hires()
         if self._tb_name is not None:
             self._tb_name.set_val(self._default_name())
         for btn_ref in [self._btn_select, self._btn_edit, self._btn_rename]:
@@ -359,7 +386,8 @@ class MultiRegionAnnotator:
             from .image_sources import composite_channel_planes
             return composite_channel_planes(
                 planes, active=self._active_channels,
-                pct_low=self._pct_low, pct_high=self._pct_high)
+                pct_low=self._pct_low, pct_high=self._pct_high,
+                use_clahe=self._use_clahe)
         return gc['disp_rgb']
 
     def _find_core_at(self, col_px, row_px):
@@ -493,6 +521,7 @@ class MultiRegionAnnotator:
 
             self.ax.clear()
             self._overlay_artists = []
+            self._hires_artist = None  # ax.clear() already dropped the old artist
             self.ax.set_autoscale_on(False)
             self.ax.set_facecolor('#1e1e1e')
             self._img_artist = self.ax.imshow(canvas_disp, origin='upper')
@@ -613,6 +642,8 @@ class MultiRegionAnnotator:
         self.ax.set_ylim(new_ylim)
         self._xlim = tuple(new_xlim)
         self._ylim = tuple(new_ylim)
+        self._clear_hires()
+        self._restart_hires_timer()
         now = time.monotonic()
         if now - self._last_scroll_t > 0.15:
             self._last_scroll_t = now
@@ -641,6 +672,8 @@ class MultiRegionAnnotator:
                 self.ax.set_ylim(new_yl)
                 self._xlim = tuple(new_xl)
                 self._ylim = tuple(new_yl)
+                self._clear_hires()
+                self._restart_hires_timer()
                 now = time.monotonic()
                 if now - self._last_pan_t >= 0.20:
                     self._last_pan_t = now
@@ -667,6 +700,76 @@ class MultiRegionAnnotator:
             self._dragging = None
             self._refresh_overlays()
             self._set_status('Vertex moved — Save GeoJSON to persist.', 'darkgreen')
+
+    # ── On-demand hi-res crop ("always sharp while zoomed in") ──────────────────
+    #
+    # The base canvas is a fixed-resolution overview (see `_pick_level` in
+    # image_sources.py) chosen to pan/zoom smoothly -- fine for judging core
+    # boundaries at a glance, but not sharp enough for fine placement once
+    # zoomed in close, since it never gets any more detailed than that one
+    # overview level. Rather than either (a) always loading a much higher-res
+    # overview (slow to pan/zoom) or (b) refetching on every single pan/zoom
+    # event (real I/O latency can't keep up with continuous drag), this waits
+    # `_hires_debounce_ms` after panning/zooming stops, then fetches just the
+    # currently-visible region from a finer pyramid level (via the canvas
+    # dict's `hires_fetcher`, see `_make_hires_fetcher`) and overlays it on
+    # the exact same coordinate footprint -- so it becomes sharp once you stop
+    # moving, and reverts to the cheap overview while you're still panning.
+
+    def _clear_hires(self):
+        if self._hires_artist is not None:
+            try:
+                self._hires_artist.remove()
+            except Exception:
+                pass
+            self._hires_artist = None
+
+    def _restart_hires_timer(self):
+        if self._hires_timer is None:
+            return
+        self._hires_timer.stop()
+        self._hires_timer.start()
+
+    def _refresh_hires(self):
+        try:
+            if self.ax is None:
+                return
+            gc = self._get_canvas(self._run)
+            fetcher = gc.get('hires_fetcher') if gc else None
+            if fetcher is None:
+                return
+
+            H, W, _ = self._img_dims()
+            x0, x1 = sorted(self.ax.get_xlim())
+            y0, y1 = sorted(self.ax.get_ylim())
+            view_w, view_h = x1 - x0, y1 - y0
+            if view_w <= 1 or view_h <= 1:
+                return
+            # Not zoomed in enough for the overview to be visibly soft --
+            # skip the fetch rather than pay for a crop that's barely
+            # sharper than what's already on screen.
+            if view_w > W * 0.5 and view_h > H * 0.5:
+                return
+
+            ax_bb = self.ax.get_window_extent()
+            target_max_dim = max(512, int(max(ax_bb.width, ax_bb.height)))
+            result = fetcher(x0, y0, x1, y1, target_max_dim=target_max_dim)
+            if result is None:
+                return
+
+            from .image_sources import composite_channel_planes
+            disp = composite_channel_planes(
+                result['channel_planes'], active=self._active_channels,
+                pct_low=self._pct_low, pct_high=self._pct_high,
+                use_clahe=self._use_clahe)
+
+            self._clear_hires()
+            self._hires_artist = self.ax.imshow(
+                disp, extent=result['extent_overview_px'], origin='upper', zorder=1)
+            self.fig.canvas.draw_idle()
+        finally:
+            if self._hires_timer is not None:
+                self._hires_timer.stop()  # defensive, in case single_shot isn't honored
 
     # ── Button callbacks ──────────────────────────────────────────────────────
 
@@ -835,6 +938,9 @@ class MultiRegionAnnotator:
         H, W, mg = self._img_dims()
         self._xlim = None
         self._ylim = None
+        if self._hires_timer is not None:
+            self._hires_timer.stop()
+        self._clear_hires()
         self.ax.set_xlim(-mg, W + mg)
         self.ax.set_ylim(H + mg, -mg)
         self.fig.canvas.draw_idle()
@@ -867,6 +973,21 @@ class MultiRegionAnnotator:
             self._set_status('Restored to normal size.', 'gray')
         self.fig.canvas.draw_idle()
 
+    def _restyle_channel_btn(self, btn, color, name, on):
+        """Distinct on/off look: ON shows the channel's real color with a
+        checkmark; OFF is flattened to gray with a cross, so state is
+        obvious at a glance rather than a subtle alpha change."""
+        if on:
+            btn.ax.set_facecolor(color)
+            btn.color = btn.hovercolor = color
+            btn.label.set_text(f'✓ {name}')
+            btn.label.set_color('black')
+        else:
+            btn.ax.set_facecolor(_C_EMPTY)
+            btn.color = btn.hovercolor = _C_EMPTY
+            btn.label.set_text(f'✗ {name}')
+            btn.label.set_color('#999999')
+
     def _on_toggle_channel(self, channel_idx):
         if self._active_channels is None:
             # First toggle: start from "all on" (every known channel), then
@@ -877,12 +998,25 @@ class MultiRegionAnnotator:
             self._active_channels.discard(channel_idx)
         else:
             self._active_channels.add(channel_idx)
-        for btn, ci in self._channel_btns:
+        for btn, ci, color, name in self._channel_btns:
             on = self._active_channels is None or ci in self._active_channels
-            btn.ax.set_alpha(1.0 if on else 0.25)
+            self._restyle_channel_btn(btn, color, name, on)
+        self.fig.canvas.draw_idle()
         self._redraw()
         n_on = len(self._active_channels)
         self._set_status(f'{n_on} channel(s) shown.', 'navy')
+
+    def _on_toggle_clahe(self, _=None):
+        self._use_clahe = not self._use_clahe
+        if self._btn_clahe is not None:
+            on = self._use_clahe
+            c = _C_ACTIVE if on else _C_EMPTY
+            self._btn_clahe.ax.set_facecolor(c)
+            self._btn_clahe.color = self._btn_clahe.hovercolor = c
+            self._btn_clahe.label.set_text('✓ CLAHE' if on else '✗ CLAHE')
+            self._btn_clahe.label.set_color('black' if on else '#999999')
+        self._redraw()
+        self._set_status(f'CLAHE {"on" if self._use_clahe else "off"}.', 'navy')
 
     def _on_apply_contrast(self, _=None):
         """Read the Low%/High% textboxes and re-render with the new
@@ -926,6 +1060,8 @@ class MultiRegionAnnotator:
         self._confirming = False
         self._xlim = None
         self._ylim = None
+        if self._hires_timer is not None:
+            self._hires_timer.stop()
         for btn_ref in [self._btn_select, self._btn_edit, self._btn_rename]:
             if btn_ref is not None:
                 btn_ref.ax.set_facecolor(_C_EMPTY)
@@ -953,6 +1089,12 @@ class MultiRegionAnnotator:
         _fig_h = min((_sh / _DPI) * 0.72, 8.5)
 
         self.fig, self.ax = plt.subplots(figsize=(_fig_w, _fig_h), dpi=_DPI)
+        self._hires_timer = self.fig.canvas.new_timer(interval=self._hires_debounce_ms)
+        try:
+            self._hires_timer.single_shot = True
+        except Exception:
+            pass  # backend doesn't support it; _refresh_hires() self-stops as a fallback
+        self._hires_timer.add_callback(self._refresh_hires)
         # Extra bottom margin vs. the original layout to fit a 3rd control
         # row (contrast cutoffs); extra top margin for the channel-toggle
         # row when the canvas has per-channel data.
@@ -980,16 +1122,19 @@ class MultiRegionAnnotator:
         # simply won't show this row at all).
         gc0 = self._get_canvas(self._run)
         channel_planes = gc0.get('channel_planes') if gc0 else None
+        channel_names = (gc0.get('channel_names', {}) if gc0 else {})
         if channel_planes:
             ch_row_y = 0.878
             n_ch = len(channel_planes)
             ch_w = min(0.12, 0.90 / n_ch)
-            for i, (c_idx, (color, _rgb, _raw)) in enumerate(channel_planes.items()):
+            for i, (c_idx, (color, _rgb, _raw, _cache)) in enumerate(channel_planes.items()):
+                name = channel_names.get(c_idx, f'Ch{c_idx}')
                 x = 0.07 + i * (ch_w + 0.008)
                 ax_c = self.fig.add_axes([x, ch_row_y, ch_w, 0.030])
-                btn = Button(ax_c, f'Ch{c_idx}', color=color, hovercolor=color)
+                btn = Button(ax_c, f'✓ {name}', color=color, hovercolor=color)
+                btn.label.set_fontsize(7)
                 btn.on_clicked(lambda _, ci=c_idx: self._on_toggle_channel(ci))
-                self._channel_btns.append((btn, c_idx))
+                self._channel_btns.append((btn, c_idx, color, name))
 
         bh = 0.048
         r1y = 0.140
@@ -1026,6 +1171,7 @@ class MultiRegionAnnotator:
             ('highlbl', 0.250, 0.075),
             ('high', 0.330, 0.090),
             ('apply', 0.440, 0.100),
+            ('clahe', 0.560, 0.130),
         ]
         axs3 = {k: self.fig.add_axes([x, r3y, w, bh]) for k, x, w in row3}
 
@@ -1054,6 +1200,8 @@ class MultiRegionAnnotator:
         self._tb_low = TextBox(axs3['low'], '', initial=str(self._pct_low), textalignment='center')
         self._tb_high = TextBox(axs3['high'], '', initial=str(self._pct_high), textalignment='center')
         btn_apply = Button(axs3['apply'], 'Apply', color='lightcyan')
+        btn_clahe = Button(axs3['clahe'], '✗ CLAHE', color=_C_EMPTY)
+        btn_clahe.label.set_color('#999999')
 
         btn_undo.on_clicked(self._on_undo)
         btn_cancel.on_clicked(self._on_cancel)
@@ -1068,16 +1216,18 @@ class MultiRegionAnnotator:
         btn_edit.on_clicked(self._on_toggle_edit)
         btn_save.on_clicked(self._on_save)
         btn_apply.on_clicked(self._on_apply_contrast)
+        btn_clahe.on_clicked(self._on_toggle_clahe)
 
         self._btn_select = btn_select
         self._btn_edit = btn_edit
         self._btn_rename = btn_rename
         self._btn_maximize = btn_maximize
+        self._btn_clahe = btn_clahe
         self._all_buttons = (
             [btn_undo, btn_cancel, btn_confirm, btn_resetz, btn_reload, btn_maximize,
              btn_select, btn_delsel, btn_rename, btn_dellast, btn_edit, btn_save,
-             btn_apply] +
-            [b for b, _ in self._run_btns] + [b for b, _ in self._channel_btns])
+             btn_apply, btn_clahe] +
+            [b for b, _ in self._run_btns] + [b for b, _, _, _ in self._channel_btns])
 
         self.fig.canvas.mpl_connect('button_press_event', self._on_click)
         self.fig.canvas.mpl_connect('button_release_event', self._on_release)
